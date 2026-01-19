@@ -8,7 +8,7 @@ Reference: robot_localization/include/robot_localization/filter_common.hpp
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Dict
 import numpy as np
 from scipy.spatial.transform import Rotation
 
@@ -74,6 +74,7 @@ class Imu:
         orientation_covariance: 3x3 covariance for orientation [roll, pitch, yaw]
         angular_velocity_covariance: 3x3 covariance for angular velocity
         linear_acceleration_covariance: 3x3 covariance for linear acceleration
+        frame_id: Frame ID of the sensor (e.g., "imu_link")
         has_orientation: Whether orientation data is valid
     """
     timestamp: float
@@ -83,6 +84,7 @@ class Imu:
     orientation_covariance: np.ndarray = field(default_factory=_default_covariance_3x3)
     angular_velocity_covariance: np.ndarray = field(default_factory=_default_covariance_3x3)
     linear_acceleration_covariance: np.ndarray = field(default_factory=_default_covariance_3x3)
+    frame_id: str = "base_link"
 
     @property
     def has_orientation(self) -> bool:
@@ -162,6 +164,8 @@ class Odometry:
         angular_velocity: Angular velocity [wx, wy, wz] in rad/s (body frame)
         pose_covariance: 6x6 covariance for pose [x, y, z, roll, pitch, yaw]
         twist_covariance: 6x6 covariance for twist [vx, vy, vz, wx, wy, wz]
+        frame_id: Frame ID of the sensor (e.g., "odom")
+        child_frame_id: Child frame ID (e.g., "base_link")
     """
     timestamp: float
     position: np.ndarray  # [x, y, z] meters, world frame
@@ -170,6 +174,8 @@ class Odometry:
     angular_velocity: np.ndarray  # [wx, wy, wz] rad/s, body frame
     pose_covariance: np.ndarray = field(default_factory=_default_covariance_6x6)
     twist_covariance: np.ndarray = field(default_factory=_default_covariance_6x6)
+    frame_id: str = "odom"
+    child_frame_id: str = "base_link"
 
     def __post_init__(self):
         """Ensure numpy arrays are the correct type."""
@@ -377,6 +383,247 @@ class Transform:
             np.ndarray: Transformed point
         """
         return self.rotation.apply(point) + self.translation
+
+    def apply_vector(self, vector: np.ndarray) -> np.ndarray:
+        """
+        Apply transform to a vector (rotation only, no translation).
+
+        Use this for velocities, accelerations, angular velocities, etc.
+
+        Args:
+            vector: 3D vector to transform
+
+        Returns:
+            np.ndarray: Transformed vector
+        """
+        return self.rotation.apply(vector)
+
+    def apply_covariance(self, covariance: np.ndarray) -> np.ndarray:
+        """
+        Transform a 3x3 covariance matrix.
+
+        Args:
+            covariance: 3x3 covariance matrix
+
+        Returns:
+            np.ndarray: Transformed 3x3 covariance matrix
+        """
+        R = self.rotation.as_matrix()
+        return R @ covariance @ R.T
+
+    def apply_covariance_6x6(self, covariance: np.ndarray) -> np.ndarray:
+        """
+        Transform a 6x6 pose covariance matrix.
+
+        The covariance is assumed to be for [x, y, z, roll, pitch, yaw].
+
+        Args:
+            covariance: 6x6 covariance matrix
+
+        Returns:
+            np.ndarray: Transformed 6x6 covariance matrix
+        """
+        R = self.rotation.as_matrix()
+        # Build 6x6 rotation matrix (position and orientation both rotate)
+        R6 = np.zeros((6, 6))
+        R6[:3, :3] = R
+        R6[3:, 3:] = R
+        return R6 @ covariance @ R6.T
+
+
+class TransformRegistry:
+    """
+    Registry for static coordinate frame transforms.
+
+    This class stores transforms between sensor frames and the robot's base frame,
+    allowing the EKF to automatically transform sensor data before fusion.
+
+    In ROS, this functionality is provided by tf2. This simplified version only
+    supports static transforms, which covers the most common use cases (sensors
+    rigidly attached to the robot body).
+
+    Usage:
+        registry = TransformRegistry(base_frame="base_link")
+
+        # Register sensor transforms (sensor_frame -> base_link)
+        registry.add_transform("imu_link", Transform(
+            translation=np.array([0.1, 0, 0.05]),
+            rotation=Rotation.from_euler('xyz', [np.pi, 0, 0])  # IMU upside-down
+        ))
+
+        # Later, transform data from sensor frame to base frame
+        accel_base = registry.transform_vector("imu_link", accel_imu)
+
+    Attributes:
+        base_frame: The target frame for all transforms (typically "base_link")
+    """
+
+    def __init__(self, base_frame: str = "base_link"):
+        """
+        Initialize the transform registry.
+
+        Args:
+            base_frame: The base frame all transforms are relative to
+        """
+        self.base_frame = base_frame
+        self._transforms: Dict[str, Transform] = {}
+
+        # Identity transform for base frame to itself
+        self._transforms[base_frame] = Transform.identity()
+
+    def add_transform(self, frame_id: str, transform: Transform) -> None:
+        """
+        Add a static transform from a sensor frame to the base frame.
+
+        The transform should take points/vectors FROM the sensor frame
+        TO the base frame.
+
+        Args:
+            frame_id: The sensor frame ID (e.g., "imu_link")
+            transform: Transform from frame_id to base_frame
+        """
+        self._transforms[frame_id] = transform
+
+    def add_transform_inverse(self, frame_id: str, transform: Transform) -> None:
+        """
+        Add a transform by specifying base_frame -> sensor_frame.
+
+        This is sometimes more intuitive (where is the sensor relative to base?).
+        The transform is automatically inverted for storage.
+
+        Args:
+            frame_id: The sensor frame ID (e.g., "imu_link")
+            transform: Transform from base_frame to frame_id
+        """
+        self._transforms[frame_id] = transform.inverse()
+
+    def has_transform(self, frame_id: str) -> bool:
+        """
+        Check if a transform is registered for a frame.
+
+        Args:
+            frame_id: The frame ID to check
+
+        Returns:
+            bool: True if transform exists
+        """
+        return frame_id in self._transforms
+
+    def get_transform(self, frame_id: str) -> Transform:
+        """
+        Get the transform from a frame to the base frame.
+
+        Args:
+            frame_id: The source frame ID
+
+        Returns:
+            Transform: Transform from frame_id to base_frame
+
+        Raises:
+            KeyError: If no transform is registered for frame_id
+        """
+        if frame_id not in self._transforms:
+            raise KeyError(
+                f"No transform registered for frame '{frame_id}'. "
+                f"Available frames: {list(self._transforms.keys())}"
+            )
+        return self._transforms[frame_id]
+
+    def transform_point(self, frame_id: str, point: np.ndarray) -> np.ndarray:
+        """
+        Transform a point from a sensor frame to the base frame.
+
+        Args:
+            frame_id: The source frame ID
+            point: 3D point in the source frame
+
+        Returns:
+            np.ndarray: Point in the base frame
+        """
+        if frame_id == self.base_frame:
+            return point
+        return self.get_transform(frame_id).apply(point)
+
+    def transform_vector(self, frame_id: str, vector: np.ndarray) -> np.ndarray:
+        """
+        Transform a vector from a sensor frame to the base frame.
+
+        Use for velocities, accelerations, angular velocities, etc.
+        Only applies rotation (no translation).
+
+        Args:
+            frame_id: The source frame ID
+            vector: 3D vector in the source frame
+
+        Returns:
+            np.ndarray: Vector in the base frame
+        """
+        if frame_id == self.base_frame:
+            return vector
+        return self.get_transform(frame_id).apply_vector(vector)
+
+    def transform_orientation(self, frame_id: str, orientation: Rotation) -> Rotation:
+        """
+        Transform an orientation from a sensor frame to the base frame.
+
+        Args:
+            frame_id: The source frame ID
+            orientation: Orientation in the source frame
+
+        Returns:
+            Rotation: Orientation in the base frame
+        """
+        if frame_id == self.base_frame:
+            return orientation
+        transform = self.get_transform(frame_id)
+        return transform.rotation * orientation
+
+    def transform_covariance_3x3(
+        self, frame_id: str, covariance: np.ndarray
+    ) -> np.ndarray:
+        """
+        Transform a 3x3 covariance matrix from a sensor frame to the base frame.
+
+        Args:
+            frame_id: The source frame ID
+            covariance: 3x3 covariance matrix in the source frame
+
+        Returns:
+            np.ndarray: Covariance matrix in the base frame
+        """
+        if frame_id == self.base_frame:
+            return covariance
+        return self.get_transform(frame_id).apply_covariance(covariance)
+
+    def transform_covariance_6x6(
+        self, frame_id: str, covariance: np.ndarray
+    ) -> np.ndarray:
+        """
+        Transform a 6x6 pose covariance matrix from a sensor frame to the base frame.
+
+        Args:
+            frame_id: The source frame ID
+            covariance: 6x6 covariance matrix in the source frame
+
+        Returns:
+            np.ndarray: Covariance matrix in the base frame
+        """
+        if frame_id == self.base_frame:
+            return covariance
+        return self.get_transform(frame_id).apply_covariance_6x6(covariance)
+
+    def list_frames(self) -> list:
+        """
+        List all registered frame IDs.
+
+        Returns:
+            list: List of frame IDs
+        """
+        return list(self._transforms.keys())
+
+    def __repr__(self) -> str:
+        frames = ", ".join(self._transforms.keys())
+        return f"TransformRegistry(base_frame='{self.base_frame}', frames=[{frames}])"
 
 
 @dataclass

@@ -39,6 +39,7 @@ from data_types import (
     TwistWithCovariance,
     EKFState,
     Transform,
+    TransformRegistry,
     Measurement,
     # Utilities
     normalize_angle,
@@ -70,6 +71,7 @@ __all__ = [
     'TwistWithCovariance',
     'EKFState',
     'Transform',
+    'TransformRegistry',
     'Measurement',
     # EKF
     'EKF',

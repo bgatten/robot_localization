@@ -23,7 +23,7 @@ from data_types import (
     POSITION_OFFSET, ORIENTATION_OFFSET,
     POSITION_V_OFFSET, ORIENTATION_V_OFFSET, POSITION_A_OFFSET,
     POSE_SIZE, TWIST_SIZE,
-    Imu, Odometry, EKFState, Measurement,
+    Imu, Odometry, EKFState, Measurement, TransformRegistry,
     normalize_angle, normalize_angles
 )
 
@@ -107,26 +107,42 @@ class EKF:
         - Linear acceleration (ax, ay, az) in world frame
 
     Usage:
+        # Basic usage (all data in base_link frame)
         ekf = EKF(config)
         ekf.set_state(initial_state)
 
         for measurement in measurements:
             if isinstance(measurement, Imu):
-                ekf.correct_imu(measurement, update_vector)
+                ekf.correct_imu(measurement)
             elif isinstance(measurement, Odometry):
-                ekf.correct_odometry(measurement, pose_update, twist_update)
+                ekf.correct_odometry(measurement)
 
             state = ekf.get_state()
+
+        # With transform registry (sensors in different frames)
+        registry = TransformRegistry(base_frame="base_link")
+        registry.add_transform("imu_link", Transform(...))
+
+        ekf = EKF(config, transform_registry=registry)
+        # Now IMU data with frame_id="imu_link" is auto-transformed
     """
 
-    def __init__(self, config: Optional[EKFConfig] = None):
+    def __init__(
+        self,
+        config: Optional[EKFConfig] = None,
+        transform_registry: Optional[TransformRegistry] = None
+    ):
         """
         Initialize the EKF.
 
         Args:
             config: EKF configuration. If None, uses defaults.
+            transform_registry: Optional registry for sensor frame transforms.
+                If provided, sensor data will be automatically transformed
+                from their frame_id to the base frame before fusion.
         """
         self.config = config or EKFConfig()
+        self._transform_registry = transform_registry
 
         # State vector and covariance
         self._state = np.zeros(STATE_SIZE)
@@ -147,6 +163,16 @@ class EKF:
         # History for debugging
         self._state_history: List[EKFState] = []
         self._record_history = False
+
+    @property
+    def transform_registry(self) -> Optional[TransformRegistry]:
+        """Get the transform registry."""
+        return self._transform_registry
+
+    @transform_registry.setter
+    def transform_registry(self, registry: Optional[TransformRegistry]) -> None:
+        """Set the transform registry."""
+        self._transform_registry = registry
 
     def reset(self) -> None:
         """Reset the filter to initial state."""
@@ -603,6 +629,9 @@ class EKF:
         """
         Process an IMU measurement.
 
+        If a transform_registry is configured and the IMU has a frame_id different
+        from base_link, the measurement data will be automatically transformed.
+
         Args:
             imu: IMU measurement data
             update_orientation: Whether to update orientation from IMU
@@ -621,20 +650,48 @@ class EKF:
             self._initialize_from_imu(imu)
             return True
 
+        # Get sensor frame transform if registry is available
+        frame_id = imu.frame_id
+        has_transform = (
+            self._transform_registry is not None and
+            self._transform_registry.has_transform(frame_id)
+        )
+
+        # Transform IMU data from sensor frame to base frame if needed
+        angular_velocity = imu.angular_velocity.copy()
+        linear_acceleration = imu.linear_acceleration.copy()
+        orientation = imu.orientation
+        ang_vel_cov = angular_velocity_covariance if angular_velocity_covariance is not None else imu.angular_velocity_covariance.copy()
+        lin_acc_cov = linear_acceleration_covariance if linear_acceleration_covariance is not None else imu.linear_acceleration_covariance.copy()
+        ori_cov = orientation_covariance if orientation_covariance is not None else imu.orientation_covariance.copy()
+
+        if has_transform:
+            # Transform vectors from sensor frame to base frame
+            angular_velocity = self._transform_registry.transform_vector(frame_id, angular_velocity)
+            linear_acceleration = self._transform_registry.transform_vector(frame_id, linear_acceleration)
+
+            # Transform orientation if available
+            if orientation is not None:
+                orientation = self._transform_registry.transform_orientation(frame_id, orientation)
+
+            # Transform covariances
+            ang_vel_cov = self._transform_registry.transform_covariance_3x3(frame_id, ang_vel_cov)
+            lin_acc_cov = self._transform_registry.transform_covariance_3x3(frame_id, lin_acc_cov)
+            ori_cov = self._transform_registry.transform_covariance_3x3(frame_id, ori_cov)
+
         # Build measurement vector and covariance
         measurement = np.zeros(STATE_SIZE)
         covariance = np.eye(STATE_SIZE) * 1e6  # Large default covariance
         update_vector = np.zeros(STATE_SIZE, dtype=bool)
 
         # Orientation
-        if update_orientation and imu.has_orientation:
-            rpy = imu.orientation.as_euler('xyz')
+        if update_orientation and orientation is not None:
+            rpy = orientation.as_euler('xyz')
             measurement[STATE_ROLL] = rpy[0]
             measurement[STATE_PITCH] = rpy[1]
             measurement[STATE_YAW] = rpy[2]
 
-            cov = orientation_covariance if orientation_covariance is not None else imu.orientation_covariance
-            covariance[STATE_ROLL:STATE_YAW + 1, STATE_ROLL:STATE_YAW + 1] = cov
+            covariance[STATE_ROLL:STATE_YAW + 1, STATE_ROLL:STATE_YAW + 1] = ori_cov
 
             update_vector[STATE_ROLL] = True
             update_vector[STATE_PITCH] = True
@@ -642,12 +699,11 @@ class EKF:
 
         # Angular velocity (body frame)
         if update_angular_velocity:
-            measurement[STATE_VROLL] = imu.angular_velocity[0]
-            measurement[STATE_VPITCH] = imu.angular_velocity[1]
-            measurement[STATE_VYAW] = imu.angular_velocity[2]
+            measurement[STATE_VROLL] = angular_velocity[0]
+            measurement[STATE_VPITCH] = angular_velocity[1]
+            measurement[STATE_VYAW] = angular_velocity[2]
 
-            cov = angular_velocity_covariance if angular_velocity_covariance is not None else imu.angular_velocity_covariance
-            covariance[STATE_VROLL:STATE_VYAW + 1, STATE_VROLL:STATE_VYAW + 1] = cov
+            covariance[STATE_VROLL:STATE_VYAW + 1, STATE_VROLL:STATE_VYAW + 1] = ang_vel_cov
 
             update_vector[STATE_VROLL] = True
             update_vector[STATE_VPITCH] = True
@@ -655,15 +711,22 @@ class EKF:
 
         # Linear acceleration (need to transform to world frame and remove gravity)
         if update_linear_acceleration:
-            accel = imu.linear_acceleration.copy()
+            accel = linear_acceleration.copy()
 
             if remove_gravity:
-                accel = self._remove_gravity(accel, imu)
+                # Create a temporary Imu with transformed data for gravity removal
+                temp_imu = Imu(
+                    timestamp=imu.timestamp,
+                    angular_velocity=angular_velocity,
+                    linear_acceleration=accel,
+                    orientation=orientation
+                )
+                accel = self._remove_gravity(accel, temp_imu)
 
             # Transform acceleration from body to world frame
             # Get current orientation from state (or from IMU if available)
-            if imu.has_orientation:
-                rot = imu.orientation
+            if orientation is not None:
+                rot = orientation
             else:
                 rot = Rotation.from_euler(
                     'xyz',
@@ -676,9 +739,7 @@ class EKF:
             measurement[STATE_AY] = accel_world[1]
             measurement[STATE_AZ] = accel_world[2]
 
-            cov = linear_acceleration_covariance if linear_acceleration_covariance is not None else imu.linear_acceleration_covariance
-            # Note: should ideally rotate covariance too, but usually small effect
-            covariance[STATE_AX:STATE_AZ + 1, STATE_AX:STATE_AZ + 1] = cov
+            covariance[STATE_AX:STATE_AZ + 1, STATE_AX:STATE_AZ + 1] = lin_acc_cov
 
             update_vector[STATE_AX] = True
             update_vector[STATE_AY] = True
@@ -707,6 +768,9 @@ class EKF:
         """
         Process an odometry measurement.
 
+        If a transform_registry is configured and the odometry has a child_frame_id
+        different from base_link, the twist data will be automatically transformed.
+
         Args:
             odom: Odometry measurement data
             pose_update_vector: 6-element bool array for [x,y,z,roll,pitch,yaw]
@@ -731,10 +795,29 @@ class EKF:
             self._initialize_from_odometry(odom)
             return True, True
 
+        # Check if we need to transform twist data (child_frame_id -> base_link)
+        child_frame_id = odom.child_frame_id
+        has_twist_transform = (
+            self._transform_registry is not None and
+            self._transform_registry.has_transform(child_frame_id)
+        )
+
+        # Get twist data, potentially transformed
+        linear_velocity = odom.linear_velocity.copy()
+        angular_velocity = odom.angular_velocity.copy()
+        twist_covariance = odom.twist_covariance.copy()
+
+        if has_twist_transform:
+            # Transform velocities from child frame to base frame
+            linear_velocity = self._transform_registry.transform_vector(child_frame_id, linear_velocity)
+            angular_velocity = self._transform_registry.transform_vector(child_frame_id, angular_velocity)
+            twist_covariance = self._transform_registry.transform_covariance_6x6(child_frame_id, twist_covariance)
+
         pose_accepted = True
         twist_accepted = True
 
         # Process pose measurement
+        # Note: Pose is typically already in the odom/world frame, so no transform needed
         if np.any(pose_update_vector):
             measurement = np.zeros(STATE_SIZE)
             covariance = np.eye(STATE_SIZE) * 1e6
@@ -781,19 +864,19 @@ class EKF:
                 'xyz',
                 [self._state[STATE_ROLL], self._state[STATE_PITCH], self._state[STATE_YAW]]
             )
-            linear_vel_world = rot.apply(odom.linear_velocity)
+            linear_vel_world = rot.apply(linear_velocity)
 
             measurement[STATE_VX] = linear_vel_world[0]
             measurement[STATE_VY] = linear_vel_world[1]
             measurement[STATE_VZ] = linear_vel_world[2]
 
             # Angular velocity stays in body frame
-            measurement[STATE_VROLL] = odom.angular_velocity[0]
-            measurement[STATE_VPITCH] = odom.angular_velocity[1]
-            measurement[STATE_VYAW] = odom.angular_velocity[2]
+            measurement[STATE_VROLL] = angular_velocity[0]
+            measurement[STATE_VPITCH] = angular_velocity[1]
+            measurement[STATE_VYAW] = angular_velocity[2]
 
             # Set covariance (ideally should rotate linear velocity covariance)
-            covariance[STATE_VX:STATE_VYAW + 1, STATE_VX:STATE_VYAW + 1] = odom.twist_covariance
+            covariance[STATE_VX:STATE_VYAW + 1, STATE_VX:STATE_VYAW + 1] = twist_covariance
 
             # Set update vector
             for i, do_update in enumerate(twist_update_vector):
