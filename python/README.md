@@ -13,7 +13,17 @@ A pure Python implementation of the robot_localization EKF that can run offline 
 ## Requirements
 
 ```bash
-pip install numpy scipy matplotlib
+pip install numpy scipy matplotlib pyyaml
+```
+
+For bag file reading (MCAP - recommended):
+```bash
+pip install mcap mcap-ros2-support
+```
+
+For bag file reading (all formats including ROS1):
+```bash
+pip install rosbags
 ```
 
 For Jupyter notebook support:
@@ -71,6 +81,8 @@ print(f"Position: {state.position}")
 |------|-------------|
 | `data_types.py` | Data classes mirroring ROS message types |
 | `ekf.py` | Extended Kalman Filter implementation |
+| `config_parser.py` | Parser for robot_localization YAML configs |
+| `bag_reader.py` | Reader for MCAP, db3, and bag files |
 | `example.py` | Standalone example with synthetic data |
 | `ekf_analysis.ipynb` | Jupyter notebook for interactive analysis |
 
@@ -203,6 +215,187 @@ registry.add_transform("rear_axle", Transform(
 ))
 ```
 
+## Configuration Parser
+
+Load robot_localization YAML configuration files to automatically configure the EKF with the same settings used in ROS.
+
+### Basic Usage
+
+```python
+from config_parser import load_config, print_config_summary
+
+# Load a robot_localization YAML config
+config = load_config("path/to/ekf.yaml")
+
+# Print a summary of the configuration
+print_config_summary(config)
+
+# Access filter settings
+print(f"Frequency: {config.frequency} Hz")
+print(f"2D Mode: {config.two_d_mode}")
+
+# Access sensors (supports arbitrary numbers: odom0, odom1, ..., imuN)
+for sensor in config.imu_sensors:
+    print(f"IMU: {sensor.name} -> {sensor.topic}")
+    print(f"  Updates: orientation={sensor.updates_pose}, gyro={sensor.updates_twist}")
+
+for sensor in config.odom_sensors:
+    print(f"Odom: {sensor.name} -> {sensor.topic}")
+```
+
+### Supported YAML Formats
+
+The parser supports both ROS1 and ROS2 YAML formats:
+
+```yaml
+# ROS2 format (with namespacing)
+ekf_filter_node:
+  ros__parameters:
+    frequency: 30.0
+    odom0: /wheel_odom
+    odom0_config: [false, false, false, ...]
+    imu0: /imu/data
+    imu0_config: [false, false, false, ...]
+
+# ROS1 format (flat)
+frequency: 30.0
+odom0: /wheel_odom
+odom0_config: [false, false, false, ...]
+```
+
+### SensorConfig Properties
+
+| Property | Description |
+|----------|-------------|
+| `name` | Sensor name (e.g., "odom0", "imu1") |
+| `sensor_type` | Type: "odom", "imu", "pose", or "twist" |
+| `topic` | ROS topic name |
+| `config` | 15-element boolean array for state updates |
+| `differential` | Use differential mode |
+| `relative` | Use relative mode |
+| `pose_rejection_threshold` | Mahalanobis threshold for pose |
+| `twist_rejection_threshold` | Mahalanobis threshold for twist |
+| `remove_gravitational_acceleration` | Remove gravity (IMU only) |
+
+## Bag File Reader
+
+Read sensor data from ROS bag files for offline processing.
+
+### Supported Formats
+
+- **MCAP** (.mcap) - ROS2 default format (recommended)
+- **SQLite3** (.db3) - ROS2 alternative format
+- **ROS1 Bag** (.bag) - Legacy ROS1 format
+
+### Installation
+
+```bash
+# For MCAP files (recommended)
+pip install mcap mcap-ros2-support
+
+# For all formats (including legacy ROS1)
+pip install rosbags
+```
+
+### Basic Usage
+
+```python
+from bag_reader import BagReader, print_bag_info
+
+# Print bag file information
+print_bag_info("recording.mcap")
+
+# Open bag and read sensor data
+reader = BagReader("recording.mcap")
+
+# Read IMU messages
+imu_data = reader.read_imu("/imu/data")
+print(f"Read {len(imu_data)} IMU messages")
+
+# Read odometry messages
+odom_data = reader.read_odometry("/odom")
+
+# Read with time filtering
+subset = reader.read_imu("/imu/data", start_time=10.0, end_time=20.0)
+```
+
+### Using with Config Parser
+
+The most powerful use case is combining the bag reader with the config parser to automatically read all configured sensors:
+
+```python
+from config_parser import load_config
+from bag_reader import BagReader
+from ekf import EKF
+
+# Load configuration
+config = load_config("ekf.yaml")
+
+# Open bag file
+reader = BagReader("recording.mcap")
+
+# Read all sensors defined in the config
+sensor_data = reader.read_all_sensors(config)
+
+# sensor_data is a dict: {"odom0": [...], "imu0": [...], ...}
+print(f"Loaded {len(sensor_data)} sensors")
+
+# Create EKF with config
+ekf = EKF(config.ekf_config)
+
+# Process data chronologically
+all_measurements = []
+for sensor_name, measurements in sensor_data.items():
+    sensor_config = config.sensors[sensor_name]
+    for m in measurements:
+        all_measurements.append((m.timestamp, sensor_name, sensor_config, m))
+
+# Sort by timestamp
+all_measurements.sort(key=lambda x: x[0])
+
+# Process each measurement
+for timestamp, sensor_name, sensor_config, measurement in all_measurements:
+    if sensor_config.sensor_type == 'imu':
+        ekf.correct_imu(
+            measurement,
+            update_orientation=sensor_config.updates_pose,
+            update_angular_velocity=sensor_config.updates_twist,
+            update_linear_acceleration=sensor_config.updates_acceleration,
+            remove_gravity=sensor_config.remove_gravitational_acceleration
+        )
+    elif sensor_config.sensor_type == 'odom':
+        ekf.correct_odometry(
+            measurement,
+            pose_update_vector=sensor_config.pose_update_vector,
+            twist_update_vector=sensor_config.twist_update_vector
+        )
+```
+
+### BagReader Methods
+
+| Method | Description |
+|--------|-------------|
+| `read_imu(topic, start_time, end_time)` | Read sensor_msgs/Imu messages |
+| `read_odometry(topic, start_time, end_time)` | Read nav_msgs/Odometry messages |
+| `read_pose(topic, start_time, end_time)` | Read PoseWithCovarianceStamped messages |
+| `read_twist(topic, start_time, end_time)` | Read TwistWithCovarianceStamped messages |
+| `read_all_sensors(config)` | Read all sensors from a RobotLocalizationConfig |
+| `read_messages(topics)` | Low-level iterator over raw messages |
+| `get_topics()` | List all topics in the bag |
+| `get_topic_type(topic)` | Get message type for a topic |
+
+### BagInfo Properties
+
+```python
+reader = BagReader("recording.mcap")
+info = reader.info
+
+print(f"Format: {info.format}")       # "mcap", "db3", or "bag"
+print(f"Duration: {info.duration}s")  # Total duration in seconds
+print(f"Topics: {info.topics}")       # Dict of topic -> message type
+print(f"Counts: {info.message_counts}")  # Dict of topic -> message count
+```
+
 ## Running the Example
 
 ```bash
@@ -293,6 +486,9 @@ ekf.correct_odometry(
 - Mahalanobis distance outlier rejection
 - Joseph form covariance update
 - Static transform support (TransformRegistry)
+- YAML configuration parser (ROS1 and ROS2 formats)
+- Bag file reader (MCAP, db3, bag formats)
+- Support for arbitrary sensor counts (odom0, odom1, ..., imuN)
 
 ### Not Implemented
 - ROS integration (by design)

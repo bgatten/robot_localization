@@ -8,6 +8,8 @@ ROS dependencies.
 Modules:
     data_types: Data classes for measurements and state
     ekf: Extended Kalman Filter implementation
+    config_parser: Parser for robot_localization YAML configuration files
+    bag_reader: Reader for ROS bag files (MCAP, db3, bag)
 
 Example:
     from robot_localization_python import EKF, EKFConfig, Imu, Odometry, EKFState
@@ -19,6 +21,13 @@ Example:
         ekf.correct_imu(imu)
 
     final_state = ekf.get_state()
+
+Example with bag file:
+    from robot_localization_python import load_config, BagReader, EKF
+
+    config = load_config("ekf.yaml")
+    reader = BagReader("recording.mcap")
+    sensor_data = reader.read_all_sensors(config)
 """
 
 from data_types import (
@@ -52,6 +61,19 @@ from ekf import (
     GRAVITATIONAL_ACCELERATION,
 )
 
+from config_parser import (
+    SensorConfig,
+    RobotLocalizationConfig,
+    load_config,
+    print_config_summary,
+)
+
+from bag_reader import (
+    BagReader,
+    BagInfo,
+    print_bag_info,
+)
+
 __version__ = "1.0.0"
 __all__ = [
     # State indices
@@ -80,4 +102,13 @@ __all__ = [
     # Utilities
     'normalize_angle',
     'normalize_angles',
+    # Config parser
+    'SensorConfig',
+    'RobotLocalizationConfig',
+    'load_config',
+    'print_config_summary',
+    # Bag reader
+    'BagReader',
+    'BagInfo',
+    'print_bag_info',
 ]
