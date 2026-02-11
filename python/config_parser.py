@@ -352,7 +352,9 @@ def load_config(yaml_path: str) -> RobotLocalizationConfig:
         process_noise_covariance=process_noise,
         initial_covariance=initial_cov,
         two_d_mode=params.get('two_d_mode', False),
-        use_dynamic_process_noise=params.get('dynamic_process_noise_covariance', False)
+        use_dynamic_process_noise=params.get('dynamic_process_noise_covariance', False),
+        mahalanobis_threshold=params.get('mahalanobis_threshold', 5.0),
+        covariance_epsilon=params.get('covariance_epsilon', 0.001)
     )
 
     # Find and parse all sensors

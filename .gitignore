@@ -5,3 +5,9 @@ doc/html
 *.cproject
 *.project
 *.settings
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+python/ekf_results.png

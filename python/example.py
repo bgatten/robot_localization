@@ -487,5 +487,132 @@ def main():
     print("\nDone!")
 
 
+def run_from_bag():
+    """
+    Example of running the EKF from a bag file and config.
+
+    This demonstrates the typical workflow for offline processing:
+    1. Load robot_localization YAML config
+    2. Read sensor data from a bag file
+    3. Run the EKF with the configured sensors
+    4. Collect and analyze results
+
+    Usage:
+        python example.py --bag recording.mcap --config ekf.yaml
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run EKF from bag file")
+    parser.add_argument("--bag", required=True, help="Path to bag file (.mcap, .db3, or .bag)")
+    parser.add_argument("--config", required=True, help="Path to robot_localization YAML config")
+    parser.add_argument("--start", type=float, default=None, help="Start time (seconds)")
+    parser.add_argument("--end", type=float, default=None, help="End time (seconds)")
+    args = parser.parse_args()
+
+    from config_parser import load_config, print_config_summary
+    from bag_reader import BagReader, print_bag_info
+
+    # Load configuration
+    print("=" * 60)
+    print("Loading configuration...")
+    config = load_config(args.config)
+    print_config_summary(config)
+
+    # Open bag file
+    print("\nLoading bag file...")
+    print_bag_info(args.bag)
+
+    reader = BagReader(args.bag)
+
+    # Read all sensors defined in the config
+    print("\nReading sensor data...")
+    sensor_data = reader.read_all_sensors(config, args.start, args.end)
+
+    if not sensor_data:
+        print("No sensor data found. Check that bag topics match config.")
+        return
+
+    # Create and run EKF
+    ekf = EKF(config.ekf_config)
+
+    # Merge all measurements and sort by timestamp
+    all_measurements = []
+    for sensor_name, measurements in sensor_data.items():
+        sensor_config = config.sensors[sensor_name]
+        for m in measurements:
+            all_measurements.append((m.timestamp, sensor_name, sensor_config, m))
+
+    all_measurements.sort(key=lambda x: x[0])
+    print(f"\nProcessing {len(all_measurements)} total measurements...")
+
+    ekf.enable_history(True)
+
+    for timestamp, sensor_name, sensor_cfg, measurement in all_measurements:
+        if sensor_cfg.sensor_type == 'imu':
+            ekf.correct_imu(
+                measurement,
+                update_orientation=sensor_cfg.updates_pose,
+                update_angular_velocity=sensor_cfg.updates_twist,
+                update_linear_acceleration=sensor_cfg.updates_acceleration,
+                remove_gravity=sensor_cfg.remove_gravitational_acceleration
+            )
+        elif sensor_cfg.sensor_type == 'odom':
+            ekf.correct_odometry(
+                measurement,
+                pose_update_vector=sensor_cfg.pose_update_vector,
+                twist_update_vector=sensor_cfg.twist_update_vector
+            )
+
+    # Get results
+    history = ekf.get_history()
+    print(f"\nEKF produced {len(history)} state estimates")
+
+    if history:
+        final = history[-1]
+        print(f"Final position: [{final.position[0]:.3f}, {final.position[1]:.3f}, {final.position[2]:.3f}]")
+        print(f"Final yaw: {np.rad2deg(final.yaw):.2f} deg")
+
+        # Plot XY trajectory
+        x = [s.position[0] for s in history]
+        y = [s.position[1] for s in history]
+        times = [s.timestamp for s in history]
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+        axes[0].plot(x, y, 'b-', linewidth=1)
+        axes[0].set_xlabel('X (m)')
+        axes[0].set_ylabel('Y (m)')
+        axes[0].set_title('XY Trajectory')
+        axes[0].axis('equal')
+        axes[0].grid(True)
+
+        axes[1].plot(times, x, 'b-', label='X')
+        axes[1].plot(times, y, 'r-', label='Y')
+        axes[1].set_xlabel('Time (s)')
+        axes[1].set_ylabel('Position (m)')
+        axes[1].set_title('Position vs Time')
+        axes[1].legend()
+        axes[1].grid(True)
+
+        yaw = [np.rad2deg(s.yaw) for s in history]
+        axes[2].plot(times, yaw, 'g-')
+        axes[2].set_xlabel('Time (s)')
+        axes[2].set_ylabel('Yaw (deg)')
+        axes[2].set_title('Yaw vs Time')
+        axes[2].grid(True)
+
+        plt.tight_layout()
+        plt.savefig('ekf_results.png', dpi=150)
+        print("\nSaved plot to ekf_results.png")
+        plt.show()
+
+    print("\nDone!")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if "--bag" in sys.argv:
+        run_from_bag()
+    else:
+        main()
